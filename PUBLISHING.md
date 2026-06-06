@@ -4,13 +4,21 @@ This file describes the shortest path from the staged open-source snapshot to a 
 
 ## 1. Set your real git identity
 
-The staged repository may use a placeholder local identity so the first commit can exist locally.
-Before pushing publicly, set your real identity inside the staged repository:
+The staged repository may use a placeholder local identity so the first commits can exist locally.
+The fastest local path is to use the helper script:
+
+```powershell
+.\publish\open-source\prepare_push.ps1 -GitUserName "Your Name" -GitUserEmail "you@example.com"
+```
+
+This rewrites the local unpublished commits to use your real identity.
+
+If you prefer to do it manually, set your real identity inside the staged repository and rewrite the unpublished local commits before pushing:
 
 ```powershell
 git config user.name "Your Name"
 git config user.email "you@example.com"
-git commit --amend --reset-author --no-edit
+git rebase --root --exec "git commit --amend --no-edit --reset-author"
 ```
 
 ## 2. Create an empty GitHub repository
@@ -32,6 +40,12 @@ Inside `publish/open-source/CppGallery/`:
 ```powershell
 git remote add origin https://github.com/<your-name>/CppGallery.git
 git push -u origin main
+```
+
+Or use the helper script from the workspace root:
+
+```powershell
+.\publish\open-source\prepare_push.ps1 -GitUserName "Your Name" -GitUserEmail "you@example.com" -RemoteUrl "https://github.com/<your-name>/CppGallery.git" -Push
 ```
 
 ## 4. Add screenshots
