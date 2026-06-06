@@ -259,6 +259,19 @@ struct ProbeResult {
     int height = 0;
 };
 
+struct GallerySourceSummary {
+    std::size_t supportedPathCount = 0;
+    std::size_t staticCandidateCount = 0;
+    std::size_t gifCandidateCount = 0;
+    std::size_t videoCandidateCount = 0;
+    bool ffmpegRuntimeAvailable = false;
+};
+
+struct GalleryLoadResult {
+    std::vector<ImageRecord> records;
+    GallerySourceSummary sourceSummary;
+};
+
 struct DecodedImage {
     std::size_t index = std::numeric_limits<std::size_t>::max();
     MediaKind kind = MediaKind::StaticImage;
@@ -1058,10 +1071,8 @@ std::optional<fs::path> ResolveFfmpegToolPath(const wchar_t* toolName) {
 }
 
 bool HasFfmpegRuntime() {
-    static const bool hasRuntime =
-        ResolveFfmpegToolPath(L"ffmpeg.exe").has_value() &&
+    return ResolveFfmpegToolPath(L"ffmpeg.exe").has_value() &&
         ResolveFfmpegToolPath(L"ffprobe.exe").has_value();
-    return hasRuntime;
 }
 
 const char* VideoRuntimeStatusText() {
@@ -1788,8 +1799,35 @@ std::vector<ImageRecord> BuildImageDatabase(const std::vector<fs::path>& paths) 
     return records;
 }
 
-std::vector<ImageRecord> LoadGalleryRecords(const fs::path& rootDirectory) {
-    return BuildImageDatabase(CollectImagePaths(rootDirectory));
+GallerySourceSummary SummarizeGallerySourcePaths(const std::vector<fs::path>& paths) {
+    GallerySourceSummary summary;
+    summary.supportedPathCount = paths.size();
+    summary.ffmpegRuntimeAvailable = HasFfmpegRuntime();
+
+    for (const fs::path& path : paths) {
+        switch (DetectMediaKind(path)) {
+        case MediaKind::AnimatedGif:
+            ++summary.gifCandidateCount;
+            break;
+        case MediaKind::Video:
+            ++summary.videoCandidateCount;
+            break;
+        case MediaKind::StaticImage:
+        default:
+            ++summary.staticCandidateCount;
+            break;
+        }
+    }
+
+    return summary;
+}
+
+GalleryLoadResult LoadGalleryData(const fs::path& rootDirectory) {
+    const std::vector<fs::path> paths = CollectImagePaths(rootDirectory);
+    GalleryLoadResult result;
+    result.sourceSummary = SummarizeGallerySourcePaths(paths);
+    result.records = BuildImageDatabase(paths);
+    return result;
 }
 
 std::string MakeWindowTitle(const fs::path& rootDirectory) {
@@ -1954,8 +1992,14 @@ class GalleryApp {
     };
 
 public:
-    GalleryApp(std::vector<ImageRecord> records, std::size_t workerCount, int maxTextureSize, bool perfTraceEnabled = false)
+    GalleryApp(
+        std::vector<ImageRecord> records,
+        GallerySourceSummary sourceSummary,
+        std::size_t workerCount,
+        int maxTextureSize,
+        bool perfTraceEnabled = false)
         : items_(std::move(records)),
+          sourceSummary_(sourceSummary),
           workerCount_(std::max<std::size_t>(1, workerCount)),
           maxTextureSize_(std::max(1024, maxTextureSize)),
           perfTraceEnabled_(perfTraceEnabled) {
@@ -2210,6 +2254,21 @@ public:
         return std::nullopt;
     }
 
+    std::string emptyStateMessage() const {
+        if (sourceSummary_.supportedPathCount == 0) {
+            return "No supported images or videos were found.";
+        }
+
+        if (sourceSummary_.videoCandidateCount > 0 && !sourceSummary_.ffmpegRuntimeAvailable) {
+            return
+                "Found video files, but FFmpeg runtime is missing.\n"
+                "Put ffmpeg.exe and ffprobe.exe beside CppGallery.exe\n"
+                "or under third_party/ffmpeg/bin, then reopen this folder.";
+        }
+
+        return "Supported files were found, but none could be loaded.";
+    }
+
     void drawGallery(ImDrawList* drawList, const ImVec2& canvasOrigin, const ImVec2& canvasSize) {
         drawList->AddRectFilledMultiColor(
             canvasOrigin,
@@ -2220,9 +2279,10 @@ public:
             kBackgroundBottom);
 
         if (layoutOrder_.empty()) {
-            const ImVec2 textSize = ImGui::CalcTextSize("No supported images or videos were found.");
+            const std::string message = emptyStateMessage();
+            const ImVec2 textSize = ImGui::CalcTextSize(message.c_str());
             const ImVec2 textPos = canvasOrigin + (canvasSize - textSize) * 0.5f;
-            drawList->AddText(textPos, IM_COL32(230, 235, 240, 255), "No supported images or videos were found.");
+            drawList->AddText(textPos, IM_COL32(230, 235, 240, 255), message.c_str());
             return;
         }
 
@@ -4274,6 +4334,7 @@ private:
     }
 
     std::vector<ImageRecord> items_;
+    GallerySourceSummary sourceSummary_;
     std::size_t workerCount_ = 1;
     int maxTextureSize_ = 16384;
 
@@ -4554,7 +4615,7 @@ int main(int argc, char** argv) {
         PrintMediaDiagnostics(rootDirectory);
         return 0;
     }
-    std::vector<ImageRecord> images = LoadGalleryRecords(rootDirectory);
+    GalleryLoadResult galleryLoad = LoadGalleryData(rootDirectory);
 
 #if defined(_WIN32)
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -4668,7 +4729,12 @@ int main(int argc, char** argv) {
     const std::size_t workerCount = RecommendedWorkerCount();
 
     {
-        auto app = std::make_unique<GalleryApp>(std::move(images), workerCount, maxTextureSize, perfTraceEnabled);
+        auto app = std::make_unique<GalleryApp>(
+            std::move(galleryLoad.records),
+            galleryLoad.sourceSummary,
+            workerCount,
+            maxTextureSize,
+            perfTraceEnabled);
         const double benchStartSeconds = glfwGetTime();
 
         while (!glfwWindowShouldClose(window)) {
@@ -4759,7 +4825,13 @@ int main(int argc, char** argv) {
                 if (const auto selectedFolder = PickFolderDialog(rootDirectory)) {
                     rootDirectory = *selectedFolder;
                     glfwSetWindowTitle(window, MakeWindowTitle(rootDirectory).c_str());
-                    app = std::make_unique<GalleryApp>(LoadGalleryRecords(rootDirectory), workerCount, maxTextureSize, perfTraceEnabled);
+                    GalleryLoadResult selectedLoad = LoadGalleryData(rootDirectory);
+                    app = std::make_unique<GalleryApp>(
+                        std::move(selectedLoad.records),
+                        selectedLoad.sourceSummary,
+                        workerCount,
+                        maxTextureSize,
+                        perfTraceEnabled);
                 }
             }
 
