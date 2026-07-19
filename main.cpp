@@ -57,6 +57,11 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#if defined(CPPGALLERY_HAS_WEBP)
+#include <webp/decode.h>
+#include <webp/demux.h>
+#endif
+
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
@@ -112,13 +117,13 @@ constexpr float kZoomWheelLinearStep = 0.16f;
 constexpr float kZoomScaleMin = 0.35f;
 constexpr float kZoomScaleMax = 8.0f;
 constexpr float kZoomDragThreshold = 6.0f;
-constexpr int kVideoPreviewMaxFrames = 36;
+constexpr int kVideoPreviewMaxFrames = 360;
 constexpr int kVideoMaxDecodeDimension = 512;
-constexpr double kVideoPreviewDurationSeconds = 2.5;
+constexpr double kVideoFallbackPreviewDurationSeconds = 2.5;
 constexpr double kVideoMinPlaybackFps = 6.0;
 constexpr double kVideoMaxPlaybackFps = 12.0;
 constexpr DWORD kVideoProbeTimeoutMs = 4000;
-constexpr DWORD kVideoDecodeTimeoutMs = 15000;
+constexpr DWORD kVideoDecodeTimeoutMs = 30000;
 constexpr std::uintmax_t kProbeFileBytesMax = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uintmax_t kStaticImageFileBytesMax = 96ULL * 1024ULL * 1024ULL;
 constexpr std::uintmax_t kGifFileBytesMax = 32ULL * 1024ULL * 1024ULL;
@@ -219,6 +224,7 @@ struct ImageRecord {
     fs::path path;
     MediaKind kind = MediaKind::StaticImage;
     double sourceFrameRate = 0.0;
+    double sourceDurationSeconds = 0.0;
     int sourceWidth = 0;
     int sourceHeight = 0;
 
@@ -255,6 +261,7 @@ struct ProbeResult {
     bool valid = false;
     MediaKind kind = MediaKind::StaticImage;
     double frameRate = 0.0;
+    double durationSeconds = 0.0;
     int width = 0;
     int height = 0;
 };
@@ -714,7 +721,13 @@ bool IsStaticImageExtension(const std::string& extension) {
         ".png", ".jpg", ".jpeg", ".bmp", ".tga",
         ".hdr", ".pic", ".ppm", ".pgm"
     };
-    return std::find(kExtensions.begin(), kExtensions.end(), extension) != kExtensions.end();
+    const bool supportedByStb =
+        std::find(kExtensions.begin(), kExtensions.end(), extension) != kExtensions.end();
+#if defined(CPPGALLERY_HAS_WEBP)
+    return supportedByStb || extension == ".webp";
+#else
+    return supportedByStb;
+#endif
 }
 
 bool IsAnimatedGifExtension(const std::string& extension) {
@@ -821,7 +834,33 @@ bool DirectoryHintsMediaRoot(const fs::path& root) {
     return false;
 }
 
+std::vector<stbi_uc> ReadBinaryFile(const fs::path& path, std::uintmax_t maxBytes);
+
+#if defined(CPPGALLERY_HAS_WEBP)
+bool ProbeWebPInfo(const fs::path& path, int& width, int& height) {
+    const std::vector<stbi_uc> fileBytes = ReadBinaryFile(path, kStaticImageFileBytesMax);
+    if (fileBytes.empty()) {
+        return false;
+    }
+
+    WebPBitstreamFeatures features{};
+    if (WebPGetFeatures(fileBytes.data(), fileBytes.size(), &features) != VP8_STATUS_OK) {
+        return false;
+    }
+
+    width = features.width;
+    height = features.height;
+    return !ExceedsDecodedImageLimits(width, height);
+}
+#endif
+
 bool ProbeImageInfo(const fs::path& path, int& width, int& height) {
+#if defined(CPPGALLERY_HAS_WEBP)
+    if (LowercaseExtension(path) == ".webp") {
+        return ProbeWebPInfo(path, width, height);
+    }
+#endif
+
     StbiStreamContext stream(path, kStbiProbeIoBudgetBytes);
     if (!stream.stream.is_open()) {
         return false;
@@ -1236,6 +1275,15 @@ double ParseFrameRateText(const std::string& text) {
     }
 }
 
+double ParsePositiveDoubleText(const std::string& text) {
+    try {
+        const double value = std::stod(text);
+        return value > 0.0 && std::isfinite(value) ? value : 0.0;
+    } catch (...) {
+        return 0.0;
+    }
+}
+
 double ClampVideoPlaybackFps(double frameRate) {
     if (frameRate <= 0.0 || !std::isfinite(frameRate)) {
         frameRate = 12.0;
@@ -1243,10 +1291,11 @@ double ClampVideoPlaybackFps(double frameRate) {
     return std::clamp(frameRate, kVideoMinPlaybackFps, kVideoMaxPlaybackFps);
 }
 
-bool ProbeVideoInfo(const fs::path& path, int& width, int& height, double& frameRate) {
+bool ProbeVideoInfo(const fs::path& path, int& width, int& height, double& frameRate, double& durationSeconds) {
     width = 0;
     height = 0;
     frameRate = 0.0;
+    durationSeconds = 0.0;
 
     const auto ffprobePath = ResolveFfmpegToolPath(L"ffprobe.exe");
     if (!ffprobePath.has_value()) {
@@ -1255,7 +1304,7 @@ bool ProbeVideoInfo(const fs::path& path, int& width, int& height, double& frame
 
     std::wostringstream command;
     command << QuoteCommandArgument(*ffprobePath)
-            << L" -v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate"
+            << L" -v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate,duration:format=duration"
             << L" -of default=noprint_wrappers=1:nokey=0 "
             << QuoteCommandArgument(path);
 
@@ -1278,16 +1327,26 @@ bool ProbeVideoInfo(const fs::path& path, int& width, int& height, double& frame
             height = std::max(0, std::atoi(line.c_str() + 7));
         } else if (line.rfind("avg_frame_rate=", 0) == 0) {
             frameRate = ParseFrameRateText(line.substr(15));
+        } else if (line.rfind("duration=", 0) == 0 && durationSeconds <= 0.0) {
+            durationSeconds = ParsePositiveDoubleText(line.substr(9));
         }
     }
 
     return width > 0 && height > 0;
 }
 
-bool ProbeMediaInfo(const fs::path& path, MediaKind kind, int& width, int& height, double& frameRate) {
+bool ProbeMediaInfo(const fs::path& path, MediaKind kind, int& width, int& height, double& frameRate, double* durationSeconds = nullptr) {
     frameRate = 0.0;
+    if (durationSeconds != nullptr) {
+        *durationSeconds = 0.0;
+    }
     if (kind == MediaKind::Video) {
-        return ProbeVideoInfo(path, width, height, frameRate);
+        double duration = 0.0;
+        const bool ok = ProbeVideoInfo(path, width, height, frameRate, duration);
+        if (durationSeconds != nullptr) {
+            *durationSeconds = duration;
+        }
+        return ok;
     }
     const std::uintmax_t maxProbeBytes = kind == MediaKind::AnimatedGif
         ? kGifFileBytesMax
@@ -1298,7 +1357,101 @@ bool ProbeMediaInfo(const fs::path& path, MediaKind kind, int& width, int& heigh
     return ProbeImageInfo(path, width, height);
 }
 
+#if defined(CPPGALLERY_HAS_WEBP)
+DecodedImage DecodeWebPFile(std::size_t index, const fs::path& path) {
+    DecodedImage decoded;
+    decoded.index = index;
+
+    std::uintmax_t fileByteCount = 0;
+    if (FileExceedsSizeLimit(path, kStaticImageFileBytesMax, &fileByteCount)) {
+        return decoded;
+    }
+
+    const std::vector<stbi_uc> fileBytes = ReadBinaryFile(path, fileByteCount);
+    if (fileBytes.empty()) {
+        return decoded;
+    }
+
+    WebPData webpData{};
+    webpData.bytes = fileBytes.data();
+    webpData.size = fileBytes.size();
+
+    WebPAnimDecoderOptions options{};
+    if (!WebPAnimDecoderOptionsInit(&options)) {
+        return decoded;
+    }
+    options.color_mode = MODE_RGBA;
+    options.use_threads = 1;
+
+    WebPAnimDecoder* decoder = WebPAnimDecoderNew(&webpData, &options);
+    if (decoder == nullptr) {
+        return decoded;
+    }
+
+    WebPAnimInfo info{};
+    if (!WebPAnimDecoderGetInfo(decoder, &info) ||
+        ExceedsDecodedImageLimits(
+            static_cast<int>(info.canvas_width),
+            static_cast<int>(info.canvas_height),
+            std::max(1, static_cast<int>(info.frame_count)))) {
+        WebPAnimDecoderDelete(decoder);
+        return decoded;
+    }
+
+    decoded.width = static_cast<int>(info.canvas_width);
+    decoded.height = static_cast<int>(info.canvas_height);
+    const int expectedFrameCount = std::max(1, static_cast<int>(info.frame_count));
+    const std::size_t frameStride =
+        static_cast<std::size_t>(decoded.width) *
+        static_cast<std::size_t>(decoded.height) *
+        4U;
+    decoded.pixels = static_cast<stbi_uc*>(
+        std::malloc(frameStride * static_cast<std::size_t>(expectedFrameCount)));
+    if (decoded.pixels == nullptr) {
+        WebPAnimDecoderDelete(decoder);
+        decoded.reset();
+        return decoded;
+    }
+
+    int decodedFrameCount = 0;
+    int previousTimestampMs = 0;
+    while (decodedFrameCount < expectedFrameCount && WebPAnimDecoderHasMoreFrames(decoder)) {
+        std::uint8_t* framePixels = nullptr;
+        int timestampMs = 0;
+        if (!WebPAnimDecoderGetNext(decoder, &framePixels, &timestampMs) || framePixels == nullptr) {
+            decoded.reset();
+            WebPAnimDecoderDelete(decoder);
+            return decoded;
+        }
+
+        std::memcpy(
+            decoded.pixels + frameStride * static_cast<std::size_t>(decodedFrameCount),
+            framePixels,
+            frameStride);
+        decoded.frameDelaysMs.push_back(std::max(1, timestampMs - previousTimestampMs));
+        previousTimestampMs = timestampMs;
+        ++decodedFrameCount;
+    }
+
+    WebPAnimDecoderDelete(decoder);
+    if (decodedFrameCount <= 0) {
+        decoded.reset();
+        return decoded;
+    }
+
+    decoded.frameCount = decodedFrameCount;
+    decoded.frameDelaysMs.resize(static_cast<std::size_t>(decodedFrameCount));
+    return decoded;
+}
+#endif
+
 DecodedImage DecodeImageFile(std::size_t index, const fs::path& path) {
+#if defined(CPPGALLERY_HAS_WEBP)
+    if (LowercaseExtension(path) == ".webp") {
+        return DecodeWebPFile(index, path);
+    }
+#endif
+
     DecodedImage decoded;
     decoded.index = index;
 
@@ -1328,7 +1481,13 @@ DecodedImage DecodeImageFile(std::size_t index, const fs::path& path) {
     return decoded;
 }
 
-DecodedImage DecodeVideoFile(std::size_t index, const fs::path& path, int sourceWidth, int sourceHeight, double sourceFrameRate) {
+DecodedImage DecodeVideoFile(
+    std::size_t index,
+    const fs::path& path,
+    int sourceWidth,
+    int sourceHeight,
+    double sourceFrameRate,
+    double sourceDurationSeconds) {
     DecodedImage decoded;
     decoded.index = index;
     decoded.kind = MediaKind::Video;
@@ -1348,11 +1507,18 @@ DecodedImage DecodeVideoFile(std::size_t index, const fs::path& path, int source
             static_cast<float>(kVideoMaxDecodeDimension) / static_cast<float>(sourceHeight)));
     const int targetWidth = std::max(2, static_cast<int>(std::floor((static_cast<float>(sourceWidth) * scale) / 2.0f)) * 2);
     const int targetHeight = std::max(2, static_cast<int>(std::floor((static_cast<float>(sourceHeight) * scale) / 2.0f)) * 2);
-    const double playbackFps = ClampVideoPlaybackFps(sourceFrameRate);
-    const int previewFrames = std::clamp(
-        static_cast<int>(std::round(playbackFps * kVideoPreviewDurationSeconds)),
-        12,
-        kVideoPreviewMaxFrames);
+    const bool hasDuration = sourceDurationSeconds > 0.0 && std::isfinite(sourceDurationSeconds);
+    const double playbackDurationSeconds = hasDuration ? sourceDurationSeconds : kVideoFallbackPreviewDurationSeconds;
+    double playbackFps = ClampVideoPlaybackFps(sourceFrameRate);
+    if (hasDuration) {
+        playbackFps = std::min(playbackFps, static_cast<double>(kVideoPreviewMaxFrames) / playbackDurationSeconds);
+    }
+    playbackFps = std::max(0.01, playbackFps);
+    const int previewFrames = std::max(
+        1,
+        std::min(
+            kVideoPreviewMaxFrames,
+            static_cast<int>(std::ceil(playbackFps * playbackDurationSeconds))));
 
     std::wostringstream command;
     command << QuoteCommandArgument(*ffmpegPath)
@@ -1364,7 +1530,11 @@ DecodedImage DecodeVideoFile(std::size_t index, const fs::path& path, int source
             << targetWidth
             << L":"
             << targetHeight
-            << L":flags=lanczos\" -frames:v "
+            << L":flags=lanczos\" ";
+    if (!hasDuration) {
+        command << L"-t " << kVideoFallbackPreviewDurationSeconds << L' ';
+    }
+    command << L"-frames:v "
             << previewFrames
             << L" -f rawvideo -pix_fmt rgba -";
 
@@ -1392,7 +1562,12 @@ DecodedImage DecodeVideoFile(std::size_t index, const fs::path& path, int source
     decoded.width = targetWidth;
     decoded.height = targetHeight;
     decoded.frameCount = frameCount;
-    decoded.frameDelaysMs.assign(static_cast<std::size_t>(frameCount), static_cast<int>(std::round(1000.0 / playbackFps)));
+    const double frameDelayMs = hasDuration
+        ? (playbackDurationSeconds * 1000.0) / static_cast<double>(frameCount)
+        : 1000.0 / playbackFps;
+    decoded.frameDelaysMs.assign(
+        static_cast<std::size_t>(frameCount),
+        std::max(1, static_cast<int>(std::round(frameDelayMs))));
     return decoded;
 }
 
@@ -1402,9 +1577,10 @@ DecodedImage DecodeGalleryFile(
     MediaKind kind,
     int sourceWidth,
     int sourceHeight,
-    double sourceFrameRate) {
+    double sourceFrameRate,
+    double sourceDurationSeconds) {
     if (kind == MediaKind::Video) {
-        return DecodeVideoFile(index, path, sourceWidth, sourceHeight, sourceFrameRate);
+        return DecodeVideoFile(index, path, sourceWidth, sourceHeight, sourceFrameRate, sourceDurationSeconds);
     }
     if (kind != MediaKind::AnimatedGif) {
         return DecodeImageFile(index, path);
@@ -1582,8 +1758,58 @@ bool PointInRect(const ImVec2& point, const ImVec2& min, const ImVec2& max) {
 }
 
 #if defined(_WIN32)
+bool CopyFilePathToClipboard(const fs::path& path) {
+    const std::wstring widePath = path.wstring();
+    if (widePath.empty()) {
+        return false;
+    }
+
+    const std::size_t pathBytes = (widePath.size() + 2U) * sizeof(wchar_t);
+    const std::size_t dropBytes = sizeof(DROPFILES) + pathBytes;
+    HGLOBAL dropHandle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, dropBytes);
+    if (dropHandle == nullptr) {
+        return false;
+    }
+
+    void* dropMemory = GlobalLock(dropHandle);
+    if (dropMemory == nullptr) {
+        GlobalFree(dropHandle);
+        return false;
+    }
+
+    auto* dropFiles = static_cast<DROPFILES*>(dropMemory);
+    dropFiles->pFiles = sizeof(DROPFILES);
+    dropFiles->fWide = TRUE;
+    auto* target = reinterpret_cast<wchar_t*>(static_cast<unsigned char*>(dropMemory) + sizeof(DROPFILES));
+    std::memcpy(target, widePath.c_str(), (widePath.size() + 1U) * sizeof(wchar_t));
+    target[widePath.size() + 1U] = L'\0';
+    GlobalUnlock(dropHandle);
+
+    if (!OpenClipboard(nullptr)) {
+        GlobalFree(dropHandle);
+        return false;
+    }
+
+    bool success = false;
+    if (EmptyClipboard() && SetClipboardData(CF_HDROP, dropHandle) != nullptr) {
+        dropHandle = nullptr;
+        success = true;
+    }
+
+    CloseClipboard();
+
+    if (dropHandle != nullptr) {
+        GlobalFree(dropHandle);
+    }
+    return success;
+}
+
 bool CopyImageFileToClipboard(const fs::path& path) {
     const MediaKind kind = DetectMediaKind(path);
+    if (kind == MediaKind::AnimatedGif || kind == MediaKind::Video) {
+        return CopyFilePathToClipboard(path);
+    }
+
     int sourceWidth = 0;
     int sourceHeight = 0;
     double sourceFrameRate = 0.0;
@@ -1594,7 +1820,8 @@ bool CopyImageFileToClipboard(const fs::path& path) {
         kind,
         sourceWidth,
         sourceHeight,
-        sourceFrameRate);
+        sourceFrameRate,
+        0.0);
     if (decoded.pixels == nullptr || decoded.width <= 0 || decoded.height <= 0) {
         return false;
     }
@@ -1754,8 +1981,9 @@ std::vector<ImageRecord> BuildImageDatabase(const std::vector<fs::path>& paths) 
                 int width = 0;
                 int height = 0;
                 double frameRate = 0.0;
-                if (ProbeMediaInfo(paths[index], kind, width, height, frameRate) && width > 0 && height > 0) {
-                    probeResults[index] = ProbeResult{true, kind, frameRate, width, height};
+                double durationSeconds = 0.0;
+                if (ProbeMediaInfo(paths[index], kind, width, height, frameRate, &durationSeconds) && width > 0 && height > 0) {
+                    probeResults[index] = ProbeResult{true, kind, frameRate, durationSeconds, width, height};
                 }
             }
         });
@@ -1773,8 +2001,9 @@ std::vector<ImageRecord> BuildImageDatabase(const std::vector<fs::path>& paths) 
         int width = 0;
         int height = 0;
         double frameRate = 0.0;
-        if (ProbeVideoInfo(paths[index], width, height, frameRate) && width > 0 && height > 0) {
-            probeResults[index] = ProbeResult{true, MediaKind::Video, frameRate, width, height};
+        double durationSeconds = 0.0;
+        if (ProbeVideoInfo(paths[index], width, height, frameRate, durationSeconds) && width > 0 && height > 0) {
+            probeResults[index] = ProbeResult{true, MediaKind::Video, frameRate, durationSeconds, width, height};
         }
     }
 
@@ -1791,6 +2020,7 @@ std::vector<ImageRecord> BuildImageDatabase(const std::vector<fs::path>& paths) 
         record.path = paths[index];
         record.kind = probe.kind;
         record.sourceFrameRate = probe.frameRate;
+        record.sourceDurationSeconds = probe.durationSeconds;
         record.sourceWidth = probe.width;
         record.sourceHeight = probe.height;
         records.push_back(std::move(record));
@@ -1889,6 +2119,19 @@ void PrintMediaDiagnostics(const fs::path& rootDirectory) {
             }
             continue;
         }
+
+#if defined(CPPGALLERY_HAS_WEBP)
+        if (LowercaseExtension(path) == ".webp") {
+            DecodedImage decoded = DecodeImageFile(std::numeric_limits<std::size_t>::max(), path);
+            if (decoded.pixels == nullptr || decoded.width != width || decoded.height != height) {
+                std::cout << "WebP decode failed: " << path.u8string() << '\n';
+                continue;
+            }
+            std::cout << "WebP decoded: " << path.filename().u8string()
+                      << " " << decoded.width << "x" << decoded.height
+                      << " frames=" << decoded.frameCount << '\n';
+        }
+#endif
 
         switch (kind) {
         case MediaKind::AnimatedGif:
@@ -3065,8 +3308,7 @@ private:
         }
 
         auto& item = items_[index];
-        if ((item.kind != MediaKind::AnimatedGif && item.kind != MediaKind::Video) ||
-            item.texture == 0 ||
+        if (item.texture == 0 ||
             item.animationFrameCount <= 1) {
             return;
         }
@@ -3706,7 +3948,7 @@ private:
             item.lastTouchedFrame = frameIndex_;
             item.residentSlot = residentIndices_.size();
             item.galleryTextureMaxDimension = MaxDimension(item.textureWidth, item.textureHeight);
-            if ((decoded.kind == MediaKind::AnimatedGif || decoded.kind == MediaKind::Video) && decoded.frameCount > 1) {
+            if (decoded.frameCount > 1) {
                 clearImageCache(item);
                 const std::size_t totalBytes =
                     static_cast<std::size_t>(decoded.width) *
@@ -4294,7 +4536,8 @@ private:
                 items_[job.index].kind,
                 items_[job.index].sourceWidth,
                 items_[job.index].sourceHeight,
-                items_[job.index].sourceFrameRate);
+                items_[job.index].sourceFrameRate,
+                items_[job.index].sourceDurationSeconds);
             decoded.mode = job.mode;
             decoded.requestedMaxDimension = job.maxDimension;
             decoded.replaceResidentTexture = job.replaceResidentTexture;

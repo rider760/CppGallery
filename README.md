@@ -80,6 +80,7 @@
 - `pic`
 - `ppm`
 - `pgm`
+- `webp`（支持静态与动画 WebP）
 
 动画图片：
 
@@ -288,6 +289,7 @@ Static images:
 - `pic`
 - `ppm`
 - `pgm`
+- `webp` (static and animated WebP)
 
 Animated images:
 

@@ -14,6 +14,7 @@ endif()
 option(CPPGALLERY_FETCH_DEPS "Download GLFW / ImGui / stb_image.h when missing." ON)
 option(CPPGALLERY_ENABLE_FFMPEG "Enable FFmpeg video support when development files are available." ON)
 option(CPPGALLERY_EMBED_FFMPEG_TOOLS "Embed local ffmpeg.exe + ffprobe.exe into the Windows executable." OFF)
+option(CPPGALLERY_ENABLE_WEBP "Enable built-in static and animated WebP decoding." ON)
 set(CPPGALLERY_FFMPEG_ROOT "" CACHE PATH "Path to an FFmpeg development package root containing include/ and lib/.")
 
 include(FetchContent)
@@ -122,8 +123,68 @@ function(cppgallery_resolve_imgui out_target)
     set(${out_target} imgui PARENT_SCOPE)
 endfunction()
 
+function(cppgallery_resolve_webp out_decoder_target out_demux_target)
+    if(TARGET WebP::webp AND TARGET WebP::webpdemux)
+        set(${out_decoder_target} WebP::webp PARENT_SCOPE)
+        set(${out_demux_target} WebP::webpdemux PARENT_SCOPE)
+        return()
+    endif()
+
+    if(TARGET webp AND TARGET webpdemux)
+        set(${out_decoder_target} webp PARENT_SCOPE)
+        set(${out_demux_target} webpdemux PARENT_SCOPE)
+        return()
+    endif()
+
+    find_package(WebP CONFIG QUIET)
+    if(TARGET WebP::webp AND TARGET WebP::webpdemux)
+        set(${out_decoder_target} WebP::webp PARENT_SCOPE)
+        set(${out_demux_target} WebP::webpdemux PARENT_SCOPE)
+        return()
+    endif()
+
+    set(local_webp_dir "${CPPGALLERY_THIRD_PARTY_DIR}/libwebp")
+    if(EXISTS "${local_webp_dir}/CMakeLists.txt")
+        add_subdirectory("${local_webp_dir}" "${CMAKE_BINARY_DIR}/libwebp-local")
+    elseif(CPPGALLERY_FETCH_DEPS)
+        set(WEBP_BUILD_ANIM_UTILS OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_CWEBP OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_DWEBP OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_GIF2WEBP OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_IMG2WEBP OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_VWEBP OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_WEBPINFO OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_WEBPMUX OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_EXTRAS OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_LIBWEBPMUX OFF CACHE BOOL "" FORCE)
+        set(WEBP_BUILD_WIC OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            libwebp
+            GIT_REPOSITORY https://github.com/webmproject/libwebp.git
+            GIT_TAG v1.5.0
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(libwebp)
+    else()
+        message(FATAL_ERROR "libwebp not found and CPPGALLERY_FETCH_DEPS=OFF.")
+    endif()
+
+    if(TARGET webp AND TARGET webpdemux)
+        set(${out_decoder_target} webp PARENT_SCOPE)
+        set(${out_demux_target} webpdemux PARENT_SCOPE)
+    elseif(TARGET WebP::webp AND TARGET WebP::webpdemux)
+        set(${out_decoder_target} WebP::webp PARENT_SCOPE)
+        set(${out_demux_target} WebP::webpdemux PARENT_SCOPE)
+    else()
+        message(FATAL_ERROR "Failed to resolve libwebp decoder and demux targets.")
+    endif()
+endfunction()
+
 cppgallery_resolve_glfw(CPPGALLERY_GLFW_TARGET)
 cppgallery_resolve_imgui(CPPGALLERY_IMGUI_TARGET)
+if(CPPGALLERY_ENABLE_WEBP)
+    cppgallery_resolve_webp(CPPGALLERY_WEBP_TARGET CPPGALLERY_WEBP_DEMUX_TARGET)
+endif()
 
 set(CPPGALLERY_STB_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/stb_image.h")
 if(NOT EXISTS "${CPPGALLERY_STB_HEADER}")
@@ -195,6 +256,11 @@ target_link_libraries(CppGallery
         ${CPPGALLERY_GLFW_TARGET}
         OpenGL::GL
 )
+
+if(CPPGALLERY_ENABLE_WEBP)
+    target_link_libraries(CppGallery PRIVATE ${CPPGALLERY_WEBP_TARGET} ${CPPGALLERY_WEBP_DEMUX_TARGET})
+    target_compile_definitions(CppGallery PRIVATE CPPGALLERY_HAS_WEBP=1)
+endif()
 
 if(CPPGALLERY_ENABLE_FFMPEG)
     set(CPPGALLERY_FFMPEG_SEARCH_ROOTS)
