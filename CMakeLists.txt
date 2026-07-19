@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0091 NEW)
 
-project(CppGallery LANGUAGES CXX)
+project(CppGallery VERSION 1.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -201,7 +201,40 @@ set(CPPGALLERY_WINDOWS_RESOURCE)
 set(CPPGALLERY_HAS_EMBEDDED_FFMPEG_TOOLS OFF)
 if(WIN32)
     set(CPPGALLERY_WINDOWS_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/cppgallery_windows_resources.rc")
-    set(CPPGALLERY_RESOURCE_LINES "#include <winres.h>\n#define IDI_APP_ICON 101\n")
+    string(CONCAT CPPGALLERY_RESOURCE_LINES
+        "#include <winres.h>\n"
+        "#define IDI_APP_ICON 101\n"
+        "VS_VERSION_INFO VERSIONINFO\n"
+        " FILEVERSION ${PROJECT_VERSION_MAJOR},${PROJECT_VERSION_MINOR},${PROJECT_VERSION_PATCH},0\n"
+        " PRODUCTVERSION ${PROJECT_VERSION_MAJOR},${PROJECT_VERSION_MINOR},${PROJECT_VERSION_PATCH},0\n"
+        " FILEFLAGSMASK 0x3fL\n"
+        "#ifdef _DEBUG\n"
+        " FILEFLAGS 0x1L\n"
+        "#else\n"
+        " FILEFLAGS 0x0L\n"
+        "#endif\n"
+        " FILEOS 0x40004L\n"
+        " FILETYPE 0x1L\n"
+        " FILESUBTYPE 0x0L\n"
+        "BEGIN\n"
+        "  BLOCK \"StringFileInfo\"\n"
+        "  BEGIN\n"
+        "    BLOCK \"040904B0\"\n"
+        "    BEGIN\n"
+        "      VALUE \"FileDescription\", \"CppGallery\"\n"
+        "      VALUE \"FileVersion\", \"${PROJECT_VERSION}\"\n"
+        "      VALUE \"InternalName\", \"CppGallery\"\n"
+        "      VALUE \"LegalCopyright\", \"Copyright (c) 2026 CppGallery contributors\"\n"
+        "      VALUE \"OriginalFilename\", \"CppGallery.exe\"\n"
+        "      VALUE \"ProductName\", \"CppGallery\"\n"
+        "      VALUE \"ProductVersion\", \"${PROJECT_VERSION}\"\n"
+        "    END\n"
+        "  END\n"
+        "  BLOCK \"VarFileInfo\"\n"
+        "  BEGIN\n"
+        "    VALUE \"Translation\", 0x0409, 1200\n"
+        "  END\n"
+        "END\n")
 
     set(CPPGALLERY_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/17807185225986.ico")
     if(EXISTS "${CPPGALLERY_APP_ICON}")
